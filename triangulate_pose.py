@@ -3,20 +3,27 @@ Triangulate 3D skeleton pose from two adjacent cameras and compare with ground t
 
 This script:
 1. Loads 2D keypoints from two cameras (blu79CF and grn43E3 stereo pair)
-2. Estimates camera parameters using PnP from known 2D-3D correspondences
-3. Triangulates 3D positions from the 2D points using estimated camera geometry
+2. Uses calibration data from ./data/calib for proper camera parameters
+3. Triangulates 3D positions from the 2D points using calibrated stereo geometry
 4. Extracts/estimates 3D ground truth from SMPL mesh
-5. Plots both triangulated and ground truth skeletons in 3D
+5. Creates 3D scene visualizations for each frame with all pedestrians
+6. Generates a video showing triangulated poses vs ground truth across all frames
 """
 
 import os
 import glob
 import json
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for video generation
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from plyfile import PlyData
 import cv2
+from pedx.utils import read_calib_file
+
+# Calibration file path (constant to avoid duplication)
+CALIB_FILE = './data/calib/calib_cam_to_cam_blu79CF-grn43E3.txt'
 
 # Skeleton connection definition for visualization
 # Maps each joint to its parent for drawing bones
@@ -147,31 +154,55 @@ def extract_keypoints_from_mesh(mesh_vertices):
 
 def get_camera_parameters():
     """
-    Get camera intrinsic parameters.
+    Get camera intrinsic parameters from calibration file.
     
     The PedX dataset uses blu79CF-grn43E3 as one stereo pair.
-    Returns intrinsic matrix K and image dimensions.
+    Returns intrinsic matrices K for both cameras and image dimensions.
     """
-    # Image dimensions for blu79CF and grn43E3
-    img_width = 3645
-    img_height = 2687
+    # Load calibration from file
+    calib = read_calib_file(CALIB_FILE)
     
-    # Estimated focal length in pixels (assuming ~50mm lens on APS-C sensor equivalent)
-    # focal_length_px = focal_mm * sensor_width_pixels / sensor_width_mm
-    focal_length_px = 3000  # pixels (estimated)
+    # Image dimensions from S_rect_00 (rectified image size)
+    img_width = int(calib['S_rect_00'][0])
+    img_height = int(calib['S_rect_00'][1])
     
-    # Principal point at image center
-    cx = img_width / 2
-    cy = img_height / 2
+    # Intrinsic matrix K from K_00 (camera 0 = blu79CF) - 3x3 stored row-major
+    K_00 = calib['K_00'].reshape(3, 3)
     
-    # Camera intrinsic matrix
-    K = np.array([
-        [focal_length_px, 0, cx],
-        [0, focal_length_px, cy],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    # Intrinsic matrix K from K_01 (camera 1 = grn43E3)
+    K_01 = calib['K_01'].reshape(3, 3)
     
-    return K, img_width, img_height
+    # Distortion coefficients (5 elements)
+    D_00 = calib['D_00']
+    D_01 = calib['D_01']
+    
+    return K_00, K_01, D_00, D_01, img_width, img_height
+
+
+def get_stereo_rectified_parameters():
+    """
+    Get stereo-rectified projection matrices from calibration file.
+    
+    Returns the rectified projection matrices P_rect_00 and P_rect_01
+    which can be used directly for triangulation.
+    """
+    # Load calibration from file
+    calib = read_calib_file(CALIB_FILE)
+    
+    # Rectified projection matrices (3x4)
+    # P_rect_00 = [K | 0] for the reference camera
+    # P_rect_01 = [K | -b*fx] where b is baseline
+    P_rect_00 = calib['P_rect_00'].reshape(3, 4)
+    P_rect_01 = calib['P_rect_01'].reshape(3, 4)
+    
+    # Rectification rotation matrices
+    R_rect_00 = calib['R_rect_00'].reshape(3, 3)
+    R_rect_01 = calib['R_rect_01'].reshape(3, 3)
+    
+    # Q matrix for reprojection from disparity (4x4)
+    Q = calib['Q'].reshape(4, 4)
+    
+    return P_rect_00, P_rect_01, R_rect_00, R_rect_01, Q
 
 
 def estimate_camera_params_pnp(keypoints_2d, keypoints_3d, K):
@@ -730,6 +761,317 @@ def find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10
     return all_errors[:n_best]
 
 
+def find_common_pedestrians(basedir_2d, basedir_3d, capture_date, frame_id):
+    """
+    Find all pedestrians that appear in both cameras (blu79CF and grn43E3)
+    and have 3D ground truth available.
+    
+    Args:
+        basedir_2d: Path to 2D labels directory
+        basedir_3d: Path to 3D labels directory  
+        capture_date: Capture date string
+        frame_id: Frame number
+    
+    Returns:
+        List of track_ids that appear in both cameras with 3D ground truth
+    """
+    # Find all track IDs in blu79CF camera
+    pattern_blu = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
+    blu_files = glob.glob(pattern_blu)
+    blu_track_ids = set()
+    for f in blu_files:
+        _, tid = parse_label_filename(f)
+        if tid is not None:
+            blu_track_ids.add(tid)
+    
+    # Find all track IDs in grn43E3 camera
+    pattern_grn = os.path.join(basedir_2d, f'{capture_date}_grn43E3_{frame_id:07d}_*.json')
+    grn_files = glob.glob(pattern_grn)
+    grn_track_ids = set()
+    for f in grn_files:
+        _, tid = parse_label_filename(f)
+        if tid is not None:
+            grn_track_ids.add(tid)
+    
+    # Find intersection (pedestrians in both cameras)
+    common_track_ids = blu_track_ids & grn_track_ids
+    
+    # Filter to only those with 3D ground truth
+    valid_track_ids = []
+    for tid in common_track_ids:
+        mesh_file = os.path.join(basedir_3d, f'{capture_date}_{frame_id:07d}_{tid}.ply')
+        if os.path.exists(mesh_file):
+            valid_track_ids.append(tid)
+    
+    return valid_track_ids
+
+
+def get_all_frame_ids(basedir_2d, capture_date):
+    """
+    Get all unique frame IDs from the dataset.
+    
+    Returns:
+        Sorted list of frame IDs
+    """
+    pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_*.json')
+    files = glob.glob(pattern)
+    
+    frame_ids = set()
+    for f in files:
+        fid, _ = parse_label_filename(f)
+        if fid is not None:
+            frame_ids.add(fid)
+    
+    return sorted(frame_ids)
+
+
+def triangulate_all_pedestrians_in_frame(basedir_2d, basedir_3d, capture_date, frame_id, P1, P2):
+    """
+    Triangulate all pedestrians visible in both cameras for a given frame.
+    
+    Args:
+        basedir_2d: Path to 2D labels directory
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        frame_id: Frame number
+        P1, P2: Projection matrices for cameras
+    
+    Returns:
+        dict: {track_id: {'triangulated': keypoints_3d, 'gt': gt_keypoints_3d}}
+    """
+    # Find pedestrians visible in both cameras with 3D GT
+    track_ids = find_common_pedestrians(basedir_2d, basedir_3d, capture_date, frame_id)
+    
+    results = {}
+    for track_id in track_ids:
+        # Load 2D keypoints from both cameras
+        keypoints_blu = load_2d_keypoints(basedir_2d, capture_date, 'blu79CF', frame_id, track_id)
+        keypoints_grn = load_2d_keypoints(basedir_2d, capture_date, 'grn43E3', frame_id, track_id)
+        
+        if keypoints_blu is None or keypoints_grn is None:
+            continue
+        
+        # Load 3D ground truth mesh
+        mesh_3d = load_3d_mesh(basedir_3d, capture_date, frame_id, track_id)
+        if mesh_3d is None:
+            continue
+        
+        # Extract ground truth keypoints
+        gt_keypoints_3d = extract_keypoints_from_mesh(mesh_3d)
+        
+        # Triangulate from 2D observations
+        triangulated_keypoints = triangulate_skeleton(keypoints_blu, keypoints_grn, P1, P2)
+        
+        if triangulated_keypoints and gt_keypoints_3d:
+            # Apply Procrustes alignment for fair comparison
+            common_keys = [k for k in triangulated_keypoints.keys() if k in gt_keypoints_3d]
+            
+            if len(common_keys) >= 4:
+                tri_points = np.array([triangulated_keypoints[k] for k in common_keys])
+                gt_points = np.array([gt_keypoints_3d[k] for k in common_keys])
+                
+                # Align using Procrustes
+                aligned_points = procrustes_alignment(tri_points, gt_points)
+                
+                # Create aligned keypoints dict
+                aligned_keypoints = {}
+                for i, name in enumerate(common_keys):
+                    aligned_keypoints[name] = aligned_points[i]
+                
+                results[track_id] = {
+                    'triangulated': aligned_keypoints,
+                    'gt': gt_keypoints_3d
+                }
+    
+    return results
+
+
+def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1, P2, 
+                              output_file=None, fig_size=(14, 10)):
+    """
+    Create a 3D scene visualization for a single frame showing all pedestrians.
+    Ground truth shown in green, triangulated poses shown in blue.
+    
+    Args:
+        basedir_2d: Path to 2D labels directory
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        frame_id: Frame number
+        P1, P2: Projection matrices for cameras
+        output_file: Optional path to save the figure
+        fig_size: Figure size tuple
+    
+    Returns:
+        numpy array of the rendered figure as an image
+    """
+    # Triangulate all pedestrians in this frame
+    all_pedestrians = triangulate_all_pedestrians_in_frame(
+        basedir_2d, basedir_3d, capture_date, frame_id, P1, P2
+    )
+    
+    # Create the figure
+    fig = plt.figure(figsize=fig_size)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Collect all points to set axis limits
+    all_points = []
+    
+    # Colors for different pedestrians (for visual distinction)
+    ped_colors_gt = plt.cm.Greens(np.linspace(0.4, 0.9, max(len(all_pedestrians), 1)))
+    ped_colors_tri = plt.cm.Blues(np.linspace(0.4, 0.9, max(len(all_pedestrians), 1)))
+    
+    # Plot each pedestrian
+    for idx, (track_id, data) in enumerate(all_pedestrians.items()):
+        gt_keypoints = data['gt']
+        tri_keypoints = data['triangulated']
+        
+        # Ground truth skeleton (green shades)
+        color_gt = ped_colors_gt[idx % len(ped_colors_gt)][:3]
+        plot_skeleton_3d(ax, gt_keypoints, color=color_gt, label=f'GT', 
+                        marker='o', linewidth=2)
+        
+        # Triangulated skeleton (blue shades)
+        color_tri = ped_colors_tri[idx % len(ped_colors_tri)][:3]
+        plot_skeleton_3d(ax, tri_keypoints, color=color_tri, label=f'Tri',
+                        marker='^', linewidth=1.5)
+        
+        # Collect points for axis limits
+        all_points.extend(list(gt_keypoints.values()))
+        all_points.extend(list(tri_keypoints.values()))
+    
+    # Set axis limits based on all points
+    if all_points:
+        all_points_arr = np.array(all_points)
+        center = np.mean(all_points_arr, axis=0)
+        max_range = np.max(np.abs(all_points_arr - center)) * 1.3
+        
+        ax.set_xlim([center[0] - max_range, center[0] + max_range])
+        ax.set_ylim([center[1] - max_range, center[1] + max_range])
+        ax.set_zlim([center[2] - max_range, center[2] + max_range])
+    
+    # Labels and title
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title(f'3D Pose: Frame {frame_id} | {len(all_pedestrians)} pedestrians\n'
+                 f'Green=Ground Truth, Blue=Triangulated', fontsize=12)
+    
+    # Set viewing angle
+    ax.view_init(elev=20, azim=45)
+    
+    # Add legend (simplified - just one entry for GT and Tri)
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='green', marker='o', linestyle='-', label='Ground Truth'),
+        Line2D([0], [0], color='blue', marker='^', linestyle='-', label='Triangulated')
+    ]
+    ax.legend(handles=legend_elements, loc='upper left')
+    
+    plt.tight_layout()
+    
+    # Convert figure to image array
+    # Note: Using buffer_rgba() instead of deprecated tostring_rgb() for matplotlib >= 3.8
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img_array = np.asarray(buf)
+    # Convert RGBA to RGB
+    img_array = img_array[:, :, :3]
+    
+    if output_file:
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"Saved frame to: {output_file}")
+    
+    plt.close(fig)
+    
+    return img_array
+
+
+def generate_video(basedir_2d, basedir_3d, capture_date, output_video='triangulation_video.mp4',
+                   fps=10, fig_size=(14, 10)):
+    """
+    Generate a video showing 3D triangulated poses vs ground truth for all frames.
+    
+    Args:
+        basedir_2d: Path to 2D labels directory
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        output_video: Output video filename
+        fps: Frames per second for the video
+        fig_size: Figure size for each frame
+    """
+    print("="*60)
+    print("Generating 3D Triangulation Video")
+    print("="*60)
+    
+    # Get rectified projection matrices from calibration
+    P1, P2, R_rect_00, R_rect_01, Q = get_stereo_rectified_parameters()
+    
+    print(f"Using calibration from ./data/calib/calib_cam_to_cam_blu79CF-grn43E3.txt")
+    print(f"Projection matrix P1 (blu79CF):\n{P1}")
+    print(f"Projection matrix P2 (grn43E3):\n{P2}")
+    
+    # Get all frame IDs
+    frame_ids = get_all_frame_ids(basedir_2d, capture_date)
+    print(f"\nFound {len(frame_ids)} frames to process")
+    print(f"Frame range: {min(frame_ids)} to {max(frame_ids)}")
+    
+    # Create output directory for frames
+    frames_dir = './output_frames'
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Collect frames with valid pedestrians
+    valid_frames = []
+    frame_images = []
+    
+    for i, frame_id in enumerate(frame_ids):
+        if (i + 1) % 20 == 0 or i == 0:
+            print(f"Processing frame {i+1}/{len(frame_ids)} (frame_id={frame_id})...")
+        
+        # Check if frame has any valid pedestrians
+        track_ids = find_common_pedestrians(basedir_2d, basedir_3d, capture_date, frame_id)
+        
+        if len(track_ids) > 0:
+            # Generate the 3D scene image
+            frame_file = os.path.join(frames_dir, f'frame_{frame_id:07d}.png')
+            img_array = visualize_frame_3d_scene(
+                basedir_2d, basedir_3d, capture_date, frame_id, P1, P2,
+                output_file=frame_file, fig_size=fig_size
+            )
+            
+            valid_frames.append(frame_id)
+            frame_images.append(img_array)
+    
+    print(f"\nGenerated {len(valid_frames)} frames with valid pedestrians")
+    
+    if len(frame_images) == 0:
+        print("ERROR: No valid frames found!")
+        return
+    
+    # Get frame dimensions
+    height, width = frame_images[0].shape[:2]
+    
+    # Create video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+    
+    print(f"\nWriting video: {output_video}")
+    print(f"Resolution: {width}x{height}, FPS: {fps}")
+    
+    for img in frame_images:
+        # Convert RGB to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        video_writer.write(img_bgr)
+    
+    video_writer.release()
+    
+    print(f"\nVideo saved to: {output_video}")
+    print(f"Total frames: {len(frame_images)}")
+    print(f"Duration: {len(frame_images)/fps:.1f} seconds")
+    print("="*60)
+    
+    return output_video
+
+
 def main():
     """Main entry point."""
     # Base directories for labels
@@ -740,75 +1082,20 @@ def main():
     capture_date = '20171207T2024'
     
     print("="*60)
-    print("Finding frames with least triangulation error...")
+    print("PedX 3D Pose Triangulation with Calibration Data")
     print("="*60)
     
-    # Find the best frames
-    best_frames = find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10)
+    # Generate the video showing all frames
+    output_video = generate_video(
+        basedir_2d, basedir_3d, capture_date,
+        output_video='triangulation_video.mp4',
+        fps=10,
+        fig_size=(14, 10)
+    )
     
     print("\n" + "="*60)
-    print("TOP 10 FRAMES WITH LEAST TRIANGULATION ERROR")
-    print("="*60)
-    for i, (frame_id, track_id, error) in enumerate(best_frames):
-        print(f"  {i+1}. Frame {frame_id}, Track {track_id[-8:]}: Mean error = {error:.4f} m")
-    
-    # Visualize the best frame
-    if best_frames:
-        best_frame_id, best_track_id, best_error = best_frames[0]
-        
-        print("\n" + "="*60)
-        print(f"Visualizing best frame (Frame {best_frame_id}, Track {best_track_id[-8:]})")
-        print("="*60)
-        
-        # Get camera intrinsic parameters
-        K, _, _ = get_camera_parameters()
-        
-        # Find all track IDs for this frame to compute averaged camera params
-        pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{best_frame_id:07d}_*.json')
-        files = glob.glob(pattern)
-        track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
-        
-        # Estimate averaged camera parameters
-        _, _, P1_avg, success1 = estimate_averaged_camera_params(
-            basedir_2d, basedir_3d, capture_date, best_frame_id, 'blu79CF', track_ids, K)
-        _, _, P2_avg, success2 = estimate_averaged_camera_params(
-            basedir_2d, basedir_3d, capture_date, best_frame_id, 'grn43E3', track_ids, K)
-        
-        if not success1 or not success2:
-            P1_avg, P2_avg = None, None
-        
-        output_file = f'best_triangulation_{capture_date}_{best_frame_id:07d}_{best_track_id[-8:]}.png'
-        visualize_triangulation(basedir_2d, basedir_3d, capture_date, best_frame_id, best_track_id,
-                               output_file=output_file, P1=P1_avg, P2=P2_avg)
-        
-        # Also visualize a few more top frames
-        print("\n" + "="*60)
-        print("Visualizing additional top frames...")
-        print("="*60)
-        
-        for i in range(1, min(3, len(best_frames))):
-            frame_id, track_id, error = best_frames[i]
-            
-            # Find all track IDs for this frame
-            pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
-            files = glob.glob(pattern)
-            track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
-            
-            # Estimate averaged camera parameters
-            _, _, P1_avg, success1 = estimate_averaged_camera_params(
-                basedir_2d, basedir_3d, capture_date, frame_id, 'blu79CF', track_ids, K)
-            _, _, P2_avg, success2 = estimate_averaged_camera_params(
-                basedir_2d, basedir_3d, capture_date, frame_id, 'grn43E3', track_ids, K)
-            
-            if not success1 or not success2:
-                P1_avg, P2_avg = None, None
-            
-            output_file = f'top{i+1}_triangulation_{capture_date}_{frame_id:07d}_{track_id[-8:]}.png'
-            visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, track_id,
-                                   output_file=output_file, P1=P1_avg, P2=P2_avg)
-    
-    print("\n" + "="*60)
-    print("Analysis complete!")
+    print("Processing complete!")
+    print(f"Output video: {output_video}")
     print("="*60)
 
 
