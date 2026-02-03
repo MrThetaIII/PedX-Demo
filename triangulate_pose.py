@@ -183,12 +183,12 @@ def estimate_camera_params_pnp(keypoints_2d, keypoints_3d, K):
     dist_coeffs = np.zeros(4)  # Assuming no lens distortion
     # Reprojection error threshold: 8 pixels is reasonable for high-res images (3645x2687)
     # This allows for some annotation noise while rejecting outliers
-    REPROJECTION_ERROR_THRESHOLD = 8.0
+    reprojection_threshold = 8.0
     
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
         points_3d, points_2d, K, dist_coeffs,
         iterationsCount=1000,
-        reprojectionError=REPROJECTION_ERROR_THRESHOLD,
+        reprojectionError=reprojection_threshold,
         flags=cv2.SOLVEPNP_ITERATIVE
     )
     
@@ -260,6 +260,10 @@ def estimate_averaged_camera_params(basedir_2d, basedir_3d, capture_date, frame_
         return None, None, None, False
     
     # Average the rotation vectors and translations
+    # Note: Averaging rotation vectors is an approximation that works well when rotations
+    # are similar (as expected for cameras viewing the same scene). For significantly
+    # different rotations, more sophisticated methods like quaternion averaging or
+    # computing the Karcher mean on SO(3) would be more accurate.
     avg_rvec = np.mean(rotation_vecs, axis=0)
     avg_t = np.mean(translations, axis=0)
     
