@@ -69,6 +69,31 @@ SMPL_KEYPOINT_VERTEX_INDICES = {
 }
 
 
+def parse_label_filename(filename):
+    """
+    Parse a 2D label filename to extract frame_id and track_id.
+    
+    Expected filename format: {capture_date}_{camera_name}_{frame_id:07d}_{track_id}.json
+    Example: 20171207T2024_blu79CF_0000055_15d1ab9781b84825b03a9cf713f52ed5.json
+    
+    Returns:
+        tuple: (frame_id, track_id) or (None, None) if parsing fails
+    """
+    basename = os.path.basename(filename)
+    name_without_ext = basename.replace('.json', '')
+    parts = name_without_ext.split('_')
+    
+    if len(parts) >= 4:
+        # frame_id is the 3rd part (index 2), track_id is the 4th part (index 3)
+        try:
+            frame_id = int(parts[2])
+            track_id = parts[3]
+            return frame_id, track_id
+        except (ValueError, IndexError):
+            return None, None
+    return None, None
+
+
 def load_2d_keypoints(basedir, capture_date, camera_name, frame_id, track_id):
     """Load 2D keypoints from a label file."""
     fn = os.path.join(basedir, f'{capture_date}_{camera_name}_{frame_id:07d}_{track_id}.json')
@@ -660,12 +685,12 @@ def find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10
     pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_*.json')
     files = glob.glob(pattern)
     
-    # Extract unique frame IDs
+    # Extract unique frame IDs using the helper function
     frame_ids = set()
     for f in files:
-        parts = os.path.basename(f).split('_')
-        frame_id = int(parts[2])
-        frame_ids.add(frame_id)
+        fid, _ = parse_label_filename(f)
+        if fid is not None:
+            frame_ids.add(fid)
     
     frame_ids = sorted(frame_ids)
     print(f"Found {len(frame_ids)} unique frames to analyze")
@@ -680,7 +705,7 @@ def find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10
         # Find track IDs for this frame
         pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
         frame_files = glob.glob(pattern)
-        track_ids = [os.path.basename(f).split('_')[-1].replace('.json', '') for f in frame_files]
+        track_ids = [parse_label_filename(f)[1] for f in frame_files if parse_label_filename(f)[1] is not None]
         
         for track_id in track_ids:
             # Check that both cameras have this track
@@ -741,7 +766,7 @@ def main():
         # Find all track IDs for this frame to compute averaged camera params
         pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{best_frame_id:07d}_*.json')
         files = glob.glob(pattern)
-        track_ids = [os.path.basename(f).split('_')[-1].replace('.json', '') for f in files]
+        track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
         
         # Estimate averaged camera parameters
         _, _, P1_avg, success1 = estimate_averaged_camera_params(
@@ -767,7 +792,7 @@ def main():
             # Find all track IDs for this frame
             pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
             files = glob.glob(pattern)
-            track_ids = [os.path.basename(f).split('_')[-1].replace('.json', '') for f in files]
+            track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
             
             # Estimate averaged camera parameters
             _, _, P1_avg, success1 = estimate_averaged_camera_params(
