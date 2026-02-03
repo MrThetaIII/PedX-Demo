@@ -3,6 +3,10 @@ triangulation_result_*.png
 best_triangulation_*.png
 top*_triangulation_*.png
 
+# Generated video and frames
+triangulation_video.mp4
+output_frames/
+
 # Python
 __pycache__/
 *.py[cod]
