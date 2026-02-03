@@ -3,9 +3,10 @@ Triangulate 3D skeleton pose from two adjacent cameras and compare with ground t
 
 This script:
 1. Loads 2D keypoints from two cameras (blu79CF and grn43E3 stereo pair)
-2. Triangulates 3D positions from the 2D points using stereo geometry
-3. Extracts/estimates 3D ground truth from SMPL mesh
-4. Plots both triangulated and ground truth skeletons in 3D
+2. Estimates camera parameters using PnP from known 2D-3D correspondences
+3. Triangulates 3D positions from the 2D points using estimated camera geometry
+4. Extracts/estimates 3D ground truth from SMPL mesh
+5. Plots both triangulated and ground truth skeletons in 3D
 """
 
 import os
@@ -15,6 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from plyfile import PlyData
+import cv2
 
 # Skeleton connection definition for visualization
 # Maps each joint to its parent for drawing bones
@@ -92,26 +94,34 @@ def load_3d_mesh(basedir, capture_date, frame_id, track_id):
 
 
 def extract_keypoints_from_mesh(mesh_vertices):
-    """Extract keypoint positions from SMPL mesh vertices."""
+    """
+    Extract keypoint positions from SMPL mesh vertices.
+    
+    SMPL uses Y-up coordinate system, so we convert to Z-up:
+    - X stays the same (left-right)
+    - Y (up in SMPL) becomes Z (up in world)
+    - Z (forward in SMPL) becomes Y (forward in world)
+    """
     keypoints_3d = {}
     for name, vertex_idx in SMPL_KEYPOINT_VERTEX_INDICES.items():
         if vertex_idx < len(mesh_vertices):
-            keypoints_3d[name] = mesh_vertices[vertex_idx]
+            # Original SMPL coordinates: (x, y, z) where Y is up
+            smpl_coords = mesh_vertices[vertex_idx]
+            # Convert to Z-up: (x, z, y) -> (x, y_new, z_new)
+            keypoints_3d[name] = np.array([
+                smpl_coords[0],   # X stays the same
+                smpl_coords[2],   # Z (SMPL forward) becomes Y
+                smpl_coords[1]    # Y (SMPL up) becomes Z
+            ])
     return keypoints_3d
 
 
 def get_camera_parameters():
     """
-    Get camera intrinsic and extrinsic parameters.
+    Get camera intrinsic parameters.
     
     The PedX dataset uses blu79CF-grn43E3 as one stereo pair.
-    Since actual calibration files are not available in the demo,
-    we estimate reasonable parameters based on:
-    - Image resolution (3645 x 2687 for blu/grn cameras)
-    - Typical industrial stereo camera baselines (~10-20cm for close range)
-    
-    Note: These are estimated parameters. For accurate triangulation,
-    use the actual calibration files from the full PedX dataset.
+    Returns intrinsic matrix K and image dimensions.
     """
     # Image dimensions for blu79CF and grn43E3
     img_width = 3645
@@ -119,38 +129,77 @@ def get_camera_parameters():
     
     # Estimated focal length in pixels (assuming ~50mm lens on APS-C sensor equivalent)
     # focal_length_px = focal_mm * sensor_width_pixels / sensor_width_mm
-    # Assuming 35mm equiv of ~50mm, with 23.5mm sensor width
     focal_length_px = 3000  # pixels (estimated)
     
     # Principal point at image center
     cx = img_width / 2
     cy = img_height / 2
     
-    # Camera intrinsic matrix (same for both cameras in rectified stereo)
+    # Camera intrinsic matrix
     K = np.array([
         [focal_length_px, 0, cx],
         [0, focal_length_px, cy],
         [0, 0, 1]
-    ])
+    ], dtype=np.float64)
     
-    # Stereo baseline (distance between cameras)
-    # Estimated at 10cm for typical stereo setup
-    baseline = 0.1  # meters
+    return K, img_width, img_height
+
+
+def estimate_camera_params_pnp(keypoints_2d, keypoints_3d, K):
+    """
+    Estimate camera extrinsic parameters using PnP (Perspective-n-Point).
     
-    # For a rectified stereo pair:
-    # Left camera (blu79CF) at origin
-    R1 = np.eye(3)
-    t1 = np.zeros(3)
+    Given known 2D keypoints and corresponding 3D ground truth positions,
+    we can solve for the camera's rotation and translation.
     
-    # Right camera (grn43E3) translated along X-axis
-    R2 = np.eye(3)
-    t2 = np.array([baseline, 0, 0])
+    Args:
+        keypoints_2d: dict of 2D keypoints from the camera
+        keypoints_3d: dict of 3D ground truth keypoint positions
+        K: Camera intrinsic matrix (3x3)
     
-    # Projection matrices
-    P1 = K @ np.hstack([R1, t1.reshape(3, 1)])
-    P2 = K @ np.hstack([R2, t2.reshape(3, 1)])
+    Returns:
+        R: Rotation matrix (3x3)
+        t: Translation vector (3,)
+        P: Projection matrix (3x4)
+        success: Whether PnP succeeded
+    """
+    # Get common keypoints between 2D and 3D
+    common_keys = []
+    for name in keypoints_2d.keys():
+        if name in keypoints_3d and keypoints_2d[name].get('visible', True):
+            common_keys.append(name)
     
-    return K, P1, P2, baseline
+    if len(common_keys) < 4:
+        print(f"Warning: Not enough common keypoints for PnP ({len(common_keys)} < 4)")
+        return None, None, None, False
+    
+    # Build arrays of 2D and 3D points
+    points_2d = np.array([[keypoints_2d[k]['x'], keypoints_2d[k]['y']] 
+                          for k in common_keys], dtype=np.float64)
+    points_3d = np.array([keypoints_3d[k] for k in common_keys], dtype=np.float64)
+    
+    # Solve PnP using RANSAC for robustness
+    dist_coeffs = np.zeros(4)  # Assuming no lens distortion
+    
+    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+        points_3d, points_2d, K, dist_coeffs,
+        iterationsCount=1000,
+        reprojectionError=8.0,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    
+    if not success:
+        print("Warning: PnP failed to find a solution")
+        return None, None, None, False
+    
+    # Convert rotation vector to rotation matrix
+    R, _ = cv2.Rodrigues(rvec)
+    t = tvec.flatten()
+    
+    # Build projection matrix P = K * [R | t]
+    P = K @ np.hstack([R, t.reshape(3, 1)])
+    
+    return R, t, P, True
 
 
 def triangulate_point(pt1, pt2, P1, P2):
@@ -274,6 +323,9 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
     """
     Main visualization function that triangulates 2D points and compares with ground truth.
     
+    Uses PnP (Perspective-n-Point) to estimate camera parameters from known 2D-3D 
+    correspondences, then performs triangulation with the estimated cameras.
+    
     Args:
         basedir_2d: Path to 2D labels directory
         basedir_3d: Path to 3D labels directory
@@ -296,20 +348,39 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
         print("Failed to load 3D mesh")
         return
     
-    # Extract ground truth keypoints from mesh
+    # Extract ground truth keypoints from mesh (with Y-up to Z-up conversion)
     gt_keypoints_3d = extract_keypoints_from_mesh(mesh_3d)
     
-    # Get camera parameters and triangulate
-    K, P1, P2, baseline = get_camera_parameters()
+    # Get camera intrinsic parameters
+    K, img_width, img_height = get_camera_parameters()
+    
+    # Estimate camera extrinsics using PnP from 2D-3D correspondences
+    # This solves the problem: given 2D keypoints and 3D GT, find camera pose
+    R1, t1, P1, success1 = estimate_camera_params_pnp(keypoints_blu, gt_keypoints_3d, K)
+    R2, t2, P2, success2 = estimate_camera_params_pnp(keypoints_grn, gt_keypoints_3d, K)
+    
+    if not success1 or not success2:
+        print("Warning: PnP estimation failed for one or both cameras")
+        print("Triangulation may be inaccurate")
+        # Fallback to simple stereo configuration
+        R1, t1 = np.eye(3), np.zeros(3)
+        R2, t2 = np.eye(3), np.array([0.1, 0, 0])
+        P1 = K @ np.hstack([R1, t1.reshape(3, 1)])
+        P2 = K @ np.hstack([R2, t2.reshape(3, 1)])
+    
+    # Triangulate using estimated camera parameters
     triangulated_keypoints = triangulate_skeleton(keypoints_blu, keypoints_grn, P1, P2)
     
     # Store raw triangulated for display (centered at origin for visualization)
-    raw_points = np.array(list(triangulated_keypoints.values()))
-    raw_centroid = np.mean(raw_points, axis=0)
-    raw_triangulated = {k: v - raw_centroid for k, v in triangulated_keypoints.items()}
+    if triangulated_keypoints:
+        raw_points = np.array(list(triangulated_keypoints.values()))
+        raw_centroid = np.mean(raw_points, axis=0)
+        raw_triangulated = {k: v - raw_centroid for k, v in triangulated_keypoints.items()}
+    else:
+        raw_triangulated = {}
     
     # Scale and transform triangulated points to match ground truth coordinate system
-    # using Procrustes alignment for better results
+    # using Procrustes alignment for comparison
     aligned_keypoints = {}
     if triangulated_keypoints and gt_keypoints_3d:
         # Get common keypoints
@@ -348,7 +419,7 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
     # Plot 2: Raw triangulated skeleton (centered at origin)
     ax2 = fig.add_subplot(222, projection='3d')
     plot_skeleton_3d(ax2, raw_triangulated, color='red', label='Raw Triangulated', marker='s')
-    ax2.set_title('Raw Triangulated\n(before alignment, centered)', fontsize=11)
+    ax2.set_title('Raw Triangulated\n(PnP-based, centered)', fontsize=11)
     ax2.set_xlabel('X (relative)')
     ax2.set_ylabel('Y (relative)')
     ax2.set_zlabel('Z (relative)')
@@ -393,6 +464,7 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
     print(f"Frame ID: {frame_id}")
     print(f"Track ID: {track_id}")
     print(f"Stereo pair: blu79CF - grn43E3")
+    print(f"Camera params estimated via: PnP (Perspective-n-Point)")
     print(f"Common keypoints triangulated: {len(aligned_keypoints)}")
     
     if aligned_keypoints and gt_keypoints_3d:
@@ -409,9 +481,8 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
             print(f"Max error:  {np.max(errors):.4f} m")
             print(f"Min error:  {np.min(errors):.4f} m")
             
-    print("\nNote: Without actual camera calibration files, triangulation uses")
-    print("      estimated parameters. For accurate results, use the calibration")
-    print("      files from the full PedX dataset (calib_cam_to_cam_blu79CF-grn43E3.txt)")
+    print("\nNote: Camera parameters are estimated using PnP from 2D-3D correspondences.")
+    print("      This uses the GT 3D pose + 2D keypoints to solve for camera extrinsics.")
 
 
 def main():
