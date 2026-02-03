@@ -69,6 +69,31 @@ SMPL_KEYPOINT_VERTEX_INDICES = {
 }
 
 
+def parse_label_filename(filename):
+    """
+    Parse a 2D label filename to extract frame_id and track_id.
+    
+    Expected filename format: {capture_date}_{camera_name}_{frame_id:07d}_{track_id}.json
+    Example: 20171207T2024_blu79CF_0000055_15d1ab9781b84825b03a9cf713f52ed5.json
+    
+    Returns:
+        tuple: (frame_id, track_id) or (None, None) if parsing fails
+    """
+    basename = os.path.basename(filename)
+    name_without_ext = basename.replace('.json', '')
+    parts = name_without_ext.split('_')
+    
+    if len(parts) >= 4:
+        # frame_id is the 3rd part (index 2), track_id is the 4th part (index 3)
+        try:
+            frame_id = int(parts[2])
+            track_id = parts[3]
+            return frame_id, track_id
+        except (ValueError, IndexError):
+            return None, None
+    return None, None
+
+
 def load_2d_keypoints(basedir, capture_date, camera_name, frame_id, track_id):
     """Load 2D keypoints from a label file."""
     fn = os.path.join(basedir, f'{capture_date}_{camera_name}_{frame_id:07d}_{track_id}.json')
@@ -97,21 +122,25 @@ def extract_keypoints_from_mesh(mesh_vertices):
     """
     Extract keypoint positions from SMPL mesh vertices.
     
-    SMPL uses Y-up coordinate system, so we convert to Z-up:
+    The SMPL mesh in this dataset has coordinates where:
+    - X is left-right
+    - Y is forward-backward (roughly constant for upright pose)
+    - Z points downward (head has lower Z than feet)
+    
+    We convert to a coordinate system where Z is up (standard for matplotlib 3D):
     - X stays the same (left-right)
-    - Y (up in SMPL) becomes Z (up in world)
-    - Z (forward in SMPL) becomes Y (forward in world)
+    - Y stays the same (forward-backward/depth)
+    - Z becomes the vertical axis (use -smpl_Z so head points up)
     """
     keypoints_3d = {}
     for name, vertex_idx in SMPL_KEYPOINT_VERTEX_INDICES.items():
         if vertex_idx < len(mesh_vertices):
-            # Original SMPL coordinates: (x, y, z) where Y is up
             smpl_coords = mesh_vertices[vertex_idx]
-            # Convert to Z-up: (x, z, y) -> (x, y_new, z_new)
+            # Convert coordinates: negate Z to make head point upward (positive Z)
             keypoints_3d[name] = np.array([
-                smpl_coords[0],   # X stays the same
-                smpl_coords[2],   # Z (SMPL forward) becomes Y
-                smpl_coords[1]    # Y (SMPL up) becomes Z
+                smpl_coords[0],    # X stays the same (left-right)
+                smpl_coords[1],    # Y stays the same (forward-backward)
+                -smpl_coords[2]    # -Z becomes Z (vertical up)
             ])
     return keypoints_3d
 
@@ -573,6 +602,132 @@ def visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, trac
     print("\nNote: Camera parameters are estimated using PnP from 2D-3D correspondences.")
     print("      Averaged params use all pedestrians for more robust camera estimation.")
     print("      This approach requires GT but validates triangulation quality.")
+    
+    # Return mean error for analysis
+    if aligned_keypoints and gt_keypoints_3d:
+        errors = []
+        for name in aligned_keypoints.keys():
+            if name in gt_keypoints_3d:
+                error = np.linalg.norm(aligned_keypoints[name] - gt_keypoints_3d[name])
+                errors.append(error)
+        return np.mean(errors) if errors else float('inf')
+    return float('inf')
+
+
+def compute_frame_error(basedir_2d, basedir_3d, capture_date, frame_id, track_id, K, P1=None, P2=None):
+    """
+    Compute the triangulation error for a single pedestrian in a frame.
+    
+    Returns:
+        mean_error: Mean error across all keypoints (in meters), or inf if computation failed
+    """
+    # Load 2D keypoints from stereo pair
+    keypoints_blu = load_2d_keypoints(basedir_2d, capture_date, 'blu79CF', frame_id, track_id)
+    keypoints_grn = load_2d_keypoints(basedir_2d, capture_date, 'grn43E3', frame_id, track_id)
+    
+    if keypoints_blu is None or keypoints_grn is None:
+        return float('inf')
+    
+    # Load 3D ground truth mesh
+    mesh_3d = load_3d_mesh(basedir_3d, capture_date, frame_id, track_id)
+    if mesh_3d is None:
+        return float('inf')
+    
+    # Extract ground truth keypoints from mesh
+    gt_keypoints_3d = extract_keypoints_from_mesh(mesh_3d)
+    
+    # Estimate camera params if not provided
+    if P1 is None or P2 is None:
+        R1, t1, P1, success1 = estimate_camera_params_pnp(keypoints_blu, gt_keypoints_3d, K)
+        R2, t2, P2, success2 = estimate_camera_params_pnp(keypoints_grn, gt_keypoints_3d, K)
+        if not success1 or not success2:
+            return float('inf')
+    
+    # Triangulate using camera parameters
+    triangulated_keypoints = triangulate_skeleton(keypoints_blu, keypoints_grn, P1, P2)
+    
+    if not triangulated_keypoints or not gt_keypoints_3d:
+        return float('inf')
+    
+    # Get common keypoints
+    common_keys = [k for k in triangulated_keypoints.keys() if k in gt_keypoints_3d]
+    
+    if len(common_keys) < 4:
+        return float('inf')
+    
+    tri_points = np.array([triangulated_keypoints[k] for k in common_keys])
+    gt_points = np.array([gt_keypoints_3d[k] for k in common_keys])
+    
+    # Align using Procrustes
+    aligned_points = procrustes_alignment(tri_points, gt_points)
+    
+    # Compute errors
+    errors = np.linalg.norm(aligned_points - gt_points, axis=1)
+    return np.mean(errors)
+
+
+def find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10):
+    """
+    Analyze all frames and find those with the least triangulation error.
+    
+    Args:
+        basedir_2d: Path to 2D labels directory
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        n_best: Number of best frames to return
+    
+    Returns:
+        List of tuples (frame_id, track_id, mean_error) sorted by error
+    """
+    K, _, _ = get_camera_parameters()
+    
+    # Find all available frames
+    pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_*.json')
+    files = glob.glob(pattern)
+    
+    # Extract unique frame IDs using the helper function
+    frame_ids = set()
+    for f in files:
+        fid, _ = parse_label_filename(f)
+        if fid is not None:
+            frame_ids.add(fid)
+    
+    frame_ids = sorted(frame_ids)
+    print(f"Found {len(frame_ids)} unique frames to analyze")
+    
+    # Collect errors for all frame-track combinations
+    all_errors = []
+    
+    for i, frame_id in enumerate(frame_ids):
+        if (i + 1) % 20 == 0:
+            print(f"Processing frame {i+1}/{len(frame_ids)}...")
+        
+        # Find track IDs for this frame
+        pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
+        frame_files = glob.glob(pattern)
+        track_ids = [parse_label_filename(f)[1] for f in frame_files if parse_label_filename(f)[1] is not None]
+        
+        for track_id in track_ids:
+            # Check that both cameras have this track
+            grn_file = os.path.join(basedir_2d, f'{capture_date}_grn43E3_{frame_id:07d}_{track_id}.json')
+            if not os.path.exists(grn_file):
+                continue
+            
+            # Check that 3D ground truth exists
+            mesh_file = os.path.join(basedir_3d, f'{capture_date}_{frame_id:07d}_{track_id}.ply')
+            if not os.path.exists(mesh_file):
+                continue
+            
+            error = compute_frame_error(basedir_2d, basedir_3d, capture_date, frame_id, track_id, K)
+            if error != float('inf'):
+                all_errors.append((frame_id, track_id, error))
+    
+    # Sort by error
+    all_errors.sort(key=lambda x: x[2])
+    
+    print(f"\nAnalyzed {len(all_errors)} frame-track combinations")
+    
+    return all_errors[:n_best]
 
 
 def main():
@@ -583,54 +738,78 @@ def main():
     
     # Demo parameters
     capture_date = '20171207T2024'
-    frame_id = 55
     
-    # Find available track IDs for this frame
-    pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
-    files = glob.glob(pattern)
-    
-    if not files:
-        print(f"No labels found for frame {frame_id}")
-        return
-    
-    # Extract track IDs
-    track_ids = [os.path.basename(f).split('_')[-1].replace('.json', '') for f in files]
-    print(f"Found {len(track_ids)} pedestrians in frame {frame_id}")
-    print(f"Track IDs: {track_ids}")
-    
-    # Get camera intrinsic parameters
-    K, _, _ = get_camera_parameters()
-    
-    # Estimate averaged camera parameters from all pedestrians in the frame
-    # This provides more robust estimates by using multiple 2D-3D correspondences
-    print("\n" + "="*60)
-    print("Estimating averaged camera parameters from all pedestrians...")
+    print("="*60)
+    print("Finding frames with least triangulation error...")
     print("="*60)
     
-    _, _, P1_avg, success1 = estimate_averaged_camera_params(
-        basedir_2d, basedir_3d, capture_date, frame_id, 'blu79CF', track_ids, K)
-    _, _, P2_avg, success2 = estimate_averaged_camera_params(
-        basedir_2d, basedir_3d, capture_date, frame_id, 'grn43E3', track_ids, K)
+    # Find the best frames
+    best_frames = find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10)
     
-    if not success1 or not success2:
-        print("Warning: Could not compute averaged camera parameters")
-        print("Falling back to per-pedestrian estimation")
-        P1_avg, P2_avg = None, None
+    print("\n" + "="*60)
+    print("TOP 10 FRAMES WITH LEAST TRIANGULATION ERROR")
+    print("="*60)
+    for i, (frame_id, track_id, error) in enumerate(best_frames):
+        print(f"  {i+1}. Frame {frame_id}, Track {track_id[-8:]}: Mean error = {error:.4f} m")
     
-    # Visualize all pedestrians using averaged camera parameters
-    for i, track_id in enumerate(track_ids):
-        print(f"\n{'='*60}")
-        print(f"Processing pedestrian {i+1}/{len(track_ids)}: {track_id[-8:]}")
-        print('='*60)
+    # Visualize the best frame
+    if best_frames:
+        best_frame_id, best_track_id, best_error = best_frames[0]
         
-        output_file = f'triangulation_result_{capture_date}_{frame_id:07d}_{track_id[-8:]}.png'
-        visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, track_id, 
+        print("\n" + "="*60)
+        print(f"Visualizing best frame (Frame {best_frame_id}, Track {best_track_id[-8:]})")
+        print("="*60)
+        
+        # Get camera intrinsic parameters
+        K, _, _ = get_camera_parameters()
+        
+        # Find all track IDs for this frame to compute averaged camera params
+        pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{best_frame_id:07d}_*.json')
+        files = glob.glob(pattern)
+        track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
+        
+        # Estimate averaged camera parameters
+        _, _, P1_avg, success1 = estimate_averaged_camera_params(
+            basedir_2d, basedir_3d, capture_date, best_frame_id, 'blu79CF', track_ids, K)
+        _, _, P2_avg, success2 = estimate_averaged_camera_params(
+            basedir_2d, basedir_3d, capture_date, best_frame_id, 'grn43E3', track_ids, K)
+        
+        if not success1 or not success2:
+            P1_avg, P2_avg = None, None
+        
+        output_file = f'best_triangulation_{capture_date}_{best_frame_id:07d}_{best_track_id[-8:]}.png'
+        visualize_triangulation(basedir_2d, basedir_3d, capture_date, best_frame_id, best_track_id,
                                output_file=output_file, P1=P1_avg, P2=P2_avg)
+        
+        # Also visualize a few more top frames
+        print("\n" + "="*60)
+        print("Visualizing additional top frames...")
+        print("="*60)
+        
+        for i in range(1, min(3, len(best_frames))):
+            frame_id, track_id, error = best_frames[i]
+            
+            # Find all track IDs for this frame
+            pattern = os.path.join(basedir_2d, f'{capture_date}_blu79CF_{frame_id:07d}_*.json')
+            files = glob.glob(pattern)
+            track_ids = [parse_label_filename(f)[1] for f in files if parse_label_filename(f)[1] is not None]
+            
+            # Estimate averaged camera parameters
+            _, _, P1_avg, success1 = estimate_averaged_camera_params(
+                basedir_2d, basedir_3d, capture_date, frame_id, 'blu79CF', track_ids, K)
+            _, _, P2_avg, success2 = estimate_averaged_camera_params(
+                basedir_2d, basedir_3d, capture_date, frame_id, 'grn43E3', track_ids, K)
+            
+            if not success1 or not success2:
+                P1_avg, P2_avg = None, None
+            
+            output_file = f'top{i+1}_triangulation_{capture_date}_{frame_id:07d}_{track_id[-8:]}.png'
+            visualize_triangulation(basedir_2d, basedir_3d, capture_date, frame_id, track_id,
+                                   output_file=output_file, P1=P1_avg, P2=P2_avg)
     
-    print(f"\n{'='*60}")
-    print(f"Completed processing {len(track_ids)} pedestrians")
-    print(f"Output files: triangulation_result_{capture_date}_{frame_id:07d}_*.png")
-    print('='*60)
+    print("\n" + "="*60)
+    print("Analysis complete!")
+    print("="*60)
 
 
 if __name__ == '__main__':
