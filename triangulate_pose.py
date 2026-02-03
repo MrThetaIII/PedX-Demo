@@ -17,6 +17,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for video generation
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D
 from plyfile import PlyData
 import cv2
@@ -761,6 +762,93 @@ def find_frames_with_least_error(basedir_2d, basedir_3d, capture_date, n_best=10
     return all_errors[:n_best]
 
 
+def compute_global_axis_limits(basedir_3d, capture_date, padding=1.0):
+    """
+    Compute global axis limits from all ground truth data for consistent visualization.
+    
+    Analyzes all 3D meshes in the dataset to determine the spatial extent of the scene,
+    then returns fixed axis limits that will work for all frames.
+    
+    Args:
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        padding: Extra padding to add around the scene (in meters)
+    
+    Returns:
+        dict with 'x_lim', 'y_lim', 'z_lim' tuples for axis limits
+    """
+    # Find all PLY files
+    pattern = os.path.join(basedir_3d, f'{capture_date}_*.ply')
+    files = glob.glob(pattern)
+    
+    if not files:
+        print(f"Warning: No PLY files found in {basedir_3d}")
+        return None
+    
+    print(f"Computing global axis limits from {len(files)} ground truth meshes...")
+    
+    # Collect all keypoint positions
+    all_x, all_y, all_z = [], [], []
+    
+    for f in files:
+        try:
+            plydata = PlyData.read(f)
+            x = np.array(plydata['vertex']['x'])
+            y = np.array(plydata['vertex']['y'])
+            z = np.array(plydata['vertex']['z'])
+            
+            # Extract keypoints at SMPL indices (same as extract_keypoints_from_mesh)
+            for name, vertex_idx in SMPL_KEYPOINT_VERTEX_INDICES.items():
+                if vertex_idx < len(x):
+                    # Apply coordinate conversion (Z becomes -Z for Z-up)
+                    all_x.append(x[vertex_idx])
+                    all_y.append(y[vertex_idx])
+                    all_z.append(-z[vertex_idx])  # Negate Z for Z-up system
+        except Exception as e:
+            print(f"Warning: Could not process PLY file {f}: {e}")
+            continue
+    
+    if not all_x:
+        print("Warning: Could not extract any keypoints from meshes")
+        return None
+    
+    all_x = np.array(all_x)
+    all_y = np.array(all_y)
+    all_z = np.array(all_z)
+    
+    # Compute limits with padding
+    x_min, x_max = all_x.min() - padding, all_x.max() + padding
+    y_min, y_max = all_y.min() - padding, all_y.max() + padding
+    z_min, z_max = all_z.min() - padding, all_z.max() + padding
+    
+    # For consistent aspect ratio, compute center and make axes similar scale
+    # User wants ~20x20m in X,Z and ~2m in Y - but we should adapt to actual data
+    x_center = (x_min + x_max) / 2
+    y_center = (y_min + y_max) / 2
+    z_center = (z_min + z_max) / 2
+    
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    z_range = z_max - z_min
+    
+    # Make X and Y have same range for better visualization (bird's eye view aspect)
+    # Keep Z range as is (height)
+    max_xy_range = max(x_range, y_range)
+    
+    limits = {
+        'x_lim': (x_center - max_xy_range/2, x_center + max_xy_range/2),
+        'y_lim': (y_center - max_xy_range/2, y_center + max_xy_range/2),
+        'z_lim': (z_min, z_max)
+    }
+    
+    print(f"Global axis limits computed:")
+    print(f"  X: {limits['x_lim'][0]:.2f} to {limits['x_lim'][1]:.2f} (range: {max_xy_range:.2f}m)")
+    print(f"  Y: {limits['y_lim'][0]:.2f} to {limits['y_lim'][1]:.2f} (range: {max_xy_range:.2f}m)")
+    print(f"  Z: {limits['z_lim'][0]:.2f} to {limits['z_lim'][1]:.2f} (range: {z_range:.2f}m)")
+    
+    return limits
+
+
 def find_common_pedestrians(basedir_2d, basedir_3d, capture_date, frame_id):
     """
     Find all pedestrians that appear in both cameras (blu79CF and grn43E3)
@@ -887,7 +975,7 @@ def triangulate_all_pedestrians_in_frame(basedir_2d, basedir_3d, capture_date, f
 
 
 def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1, P2, 
-                              output_file=None, fig_size=(14, 10)):
+                              output_file=None, fig_size=(14, 10), axis_limits=None):
     """
     Create a 3D scene visualization for a single frame showing all pedestrians.
     Ground truth shown in green, triangulated poses shown in blue.
@@ -900,6 +988,7 @@ def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1,
         P1, P2: Projection matrices for cameras
         output_file: Optional path to save the figure
         fig_size: Figure size tuple
+        axis_limits: Optional dict with 'x_lim', 'y_lim', 'z_lim' for fixed axis limits
     
     Returns:
         numpy array of the rendered figure as an image
@@ -912,9 +1001,6 @@ def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1,
     # Create the figure
     fig = plt.figure(figsize=fig_size)
     ax = fig.add_subplot(111, projection='3d')
-    
-    # Collect all points to set axis limits
-    all_points = []
     
     # Colors for different pedestrians (for visual distinction)
     ped_colors_gt = plt.cm.Greens(np.linspace(0.4, 0.9, max(len(all_pedestrians), 1)))
@@ -934,20 +1020,25 @@ def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1,
         color_tri = ped_colors_tri[idx % len(ped_colors_tri)][:3]
         plot_skeleton_3d(ax, tri_keypoints, color=color_tri, label=f'Tri',
                         marker='^', linewidth=1.5)
-        
-        # Collect points for axis limits
-        all_points.extend(list(gt_keypoints.values()))
-        all_points.extend(list(tri_keypoints.values()))
     
-    # Set axis limits based on all points
-    if all_points:
-        all_points_arr = np.array(all_points)
-        center = np.mean(all_points_arr, axis=0)
-        max_range = np.max(np.abs(all_points_arr - center)) * 1.3
-        
-        ax.set_xlim([center[0] - max_range, center[0] + max_range])
-        ax.set_ylim([center[1] - max_range, center[1] + max_range])
-        ax.set_zlim([center[2] - max_range, center[2] + max_range])
+    # Set axis limits - use fixed limits if provided, otherwise compute from data
+    if axis_limits is not None:
+        ax.set_xlim(axis_limits['x_lim'])
+        ax.set_ylim(axis_limits['y_lim'])
+        ax.set_zlim(axis_limits['z_lim'])
+    else:
+        # Fallback: compute from current frame data
+        all_points = []
+        for data in all_pedestrians.values():
+            all_points.extend(list(data['gt'].values()))
+            all_points.extend(list(data['triangulated'].values()))
+        if all_points:
+            all_points_arr = np.array(all_points)
+            center = np.mean(all_points_arr, axis=0)
+            max_range = np.max(np.abs(all_points_arr - center)) * 1.3
+            ax.set_xlim([center[0] - max_range, center[0] + max_range])
+            ax.set_ylim([center[1] - max_range, center[1] + max_range])
+            ax.set_zlim([center[2] - max_range, center[2] + max_range])
     
     # Labels and title
     ax.set_xlabel('X (m)')
@@ -960,7 +1051,6 @@ def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1,
     ax.view_init(elev=20, azim=45)
     
     # Add legend (simplified - just one entry for GT and Tri)
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color='green', marker='o', linestyle='-', label='Ground Truth'),
         Line2D([0], [0], color='blue', marker='^', linestyle='-', label='Triangulated')
@@ -986,27 +1076,131 @@ def visualize_frame_3d_scene(basedir_2d, basedir_3d, capture_date, frame_id, P1,
     return img_array
 
 
+def visualize_frame_gt_only(basedir_3d, capture_date, frame_id, 
+                            output_file=None, fig_size=(14, 10), axis_limits=None):
+    """
+    Create a 3D scene visualization showing only ground truth poses.
+    
+    Args:
+        basedir_3d: Path to 3D labels directory
+        capture_date: Capture date string
+        frame_id: Frame number
+        output_file: Optional path to save the figure
+        fig_size: Figure size tuple
+        axis_limits: Optional dict with 'x_lim', 'y_lim', 'z_lim' for fixed axis limits
+    
+    Returns:
+        numpy array of the rendered figure as an image
+    """
+    # Find all meshes for this frame
+    pattern = os.path.join(basedir_3d, f'{capture_date}_{frame_id:07d}_*.ply')
+    mesh_files = glob.glob(pattern)
+    
+    # Create the figure
+    fig = plt.figure(figsize=fig_size)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Colors for different pedestrians
+    num_peds = max(len(mesh_files), 1)
+    ped_colors = plt.cm.Greens(np.linspace(0.4, 0.9, num_peds))
+    
+    # Plot each pedestrian's ground truth
+    for idx, mesh_file in enumerate(mesh_files):
+        try:
+            # Extract track_id from filename
+            basename = os.path.basename(mesh_file)
+            parts = basename.replace('.ply', '').split('_')
+            if len(parts) >= 3:
+                track_id = parts[2]
+            else:
+                track_id = f"ped_{idx}"
+            
+            # Load and extract keypoints
+            mesh_3d = load_3d_mesh(basedir_3d, capture_date, frame_id, track_id)
+            if mesh_3d is None:
+                continue
+            
+            gt_keypoints = extract_keypoints_from_mesh(mesh_3d)
+            
+            # Plot ground truth skeleton
+            color_gt = ped_colors[idx % num_peds][:3]
+            plot_skeleton_3d(ax, gt_keypoints, color=color_gt, label=f'GT', 
+                            marker='o', linewidth=2)
+        except Exception as e:
+            print(f"Warning: Could not process mesh for track {track_id}: {e}")
+            continue
+    
+    # Set axis limits
+    if axis_limits is not None:
+        ax.set_xlim(axis_limits['x_lim'])
+        ax.set_ylim(axis_limits['y_lim'])
+        ax.set_zlim(axis_limits['z_lim'])
+    
+    # Labels and title
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title(f'3D Ground Truth: Frame {frame_id} | {len(mesh_files)} pedestrians', fontsize=12)
+    
+    # Set viewing angle
+    ax.view_init(elev=20, azim=45)
+    
+    # Add legend
+    legend_elements = [
+        Line2D([0], [0], color='green', marker='o', linestyle='-', label='Ground Truth')
+    ]
+    ax.legend(handles=legend_elements, loc='upper left')
+    
+    plt.tight_layout()
+    
+    # Convert figure to image array
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img_array = np.asarray(buf)
+    img_array = img_array[:, :, :3]
+    
+    if output_file:
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"Saved frame to: {output_file}")
+    
+    plt.close(fig)
+    
+    return img_array
+
+
 def generate_video(basedir_2d, basedir_3d, capture_date, output_video='triangulation_video.mp4',
                    fps=10, fig_size=(14, 10)):
     """
-    Generate a video showing 3D triangulated poses vs ground truth for all frames.
+    Generate two videos showing 3D poses for all frames with consistent axis limits:
+    1. Triangulated poses vs ground truth (combined view)
+    2. Ground truth only
     
     Args:
         basedir_2d: Path to 2D labels directory
         basedir_3d: Path to 3D labels directory
         capture_date: Capture date string
-        output_video: Output video filename
+        output_video: Output video filename for triangulated video
         fps: Frames per second for the video
         fig_size: Figure size for each frame
+    
+    Returns:
+        tuple: (triangulation_video_path, gt_video_path)
     """
     print("="*60)
-    print("Generating 3D Triangulation Video")
+    print("Generating 3D Triangulation Videos")
     print("="*60)
+    
+    # Compute global axis limits from ground truth for consistent visualization
+    axis_limits = compute_global_axis_limits(basedir_3d, capture_date, padding=1.0)
+    
+    if axis_limits is None:
+        print("ERROR: Could not compute axis limits from ground truth data")
+        return None, None
     
     # Get rectified projection matrices from calibration
     P1, P2, R_rect_00, R_rect_01, Q = get_stereo_rectified_parameters()
     
-    print(f"Using calibration from ./data/calib/calib_cam_to_cam_blu79CF-grn43E3.txt")
+    print(f"\nUsing calibration from ./data/calib/calib_cam_to_cam_blu79CF-grn43E3.txt")
     print(f"Projection matrix P1 (blu79CF):\n{P1}")
     print(f"Projection matrix P2 (grn43E3):\n{P2}")
     
@@ -1015,61 +1209,87 @@ def generate_video(basedir_2d, basedir_3d, capture_date, output_video='triangula
     print(f"\nFound {len(frame_ids)} frames to process")
     print(f"Frame range: {min(frame_ids)} to {max(frame_ids)}")
     
-    # Create output directory for frames
-    frames_dir = './output_frames'
-    os.makedirs(frames_dir, exist_ok=True)
+    # Create output directories for frames
+    frames_dir_tri = './output_frames_triangulated'
+    frames_dir_gt = './output_frames_gt'
+    os.makedirs(frames_dir_tri, exist_ok=True)
+    os.makedirs(frames_dir_gt, exist_ok=True)
     
     # Collect frames with valid pedestrians
     valid_frames = []
-    frame_images = []
+    frame_images_tri = []
+    frame_images_gt = []
     
     for i, frame_id in enumerate(frame_ids):
         if (i + 1) % 20 == 0 or i == 0:
             print(f"Processing frame {i+1}/{len(frame_ids)} (frame_id={frame_id})...")
         
-        # Check if frame has any valid pedestrians
+        # Check if frame has any valid pedestrians (in both cameras with 3D GT)
         track_ids = find_common_pedestrians(basedir_2d, basedir_3d, capture_date, frame_id)
         
         if len(track_ids) > 0:
-            # Generate the 3D scene image
-            frame_file = os.path.join(frames_dir, f'frame_{frame_id:07d}.png')
-            img_array = visualize_frame_3d_scene(
+            # Generate the triangulated + GT scene image with fixed axis limits
+            frame_file_tri = os.path.join(frames_dir_tri, f'frame_{frame_id:07d}.png')
+            img_array_tri = visualize_frame_3d_scene(
                 basedir_2d, basedir_3d, capture_date, frame_id, P1, P2,
-                output_file=frame_file, fig_size=fig_size
+                output_file=frame_file_tri, fig_size=fig_size, axis_limits=axis_limits
+            )
+            
+            # Generate the GT-only scene image with fixed axis limits
+            frame_file_gt = os.path.join(frames_dir_gt, f'frame_{frame_id:07d}.png')
+            img_array_gt = visualize_frame_gt_only(
+                basedir_3d, capture_date, frame_id,
+                output_file=frame_file_gt, fig_size=fig_size, axis_limits=axis_limits
             )
             
             valid_frames.append(frame_id)
-            frame_images.append(img_array)
+            frame_images_tri.append(img_array_tri)
+            frame_images_gt.append(img_array_gt)
     
     print(f"\nGenerated {len(valid_frames)} frames with valid pedestrians")
     
-    if len(frame_images) == 0:
+    if len(frame_images_tri) == 0:
         print("ERROR: No valid frames found!")
-        return
+        return None, None
     
     # Get frame dimensions
-    height, width = frame_images[0].shape[:2]
+    height_tri, width_tri = frame_images_tri[0].shape[:2]
+    height_gt, width_gt = frame_images_gt[0].shape[:2]
     
-    # Create video writer
+    # Create video writer for triangulated video
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+    video_writer_tri = cv2.VideoWriter(output_video, fourcc, fps, (width_tri, height_tri))
     
-    print(f"\nWriting video: {output_video}")
-    print(f"Resolution: {width}x{height}, FPS: {fps}")
+    print(f"\nWriting triangulated video: {output_video}")
+    print(f"Resolution: {width_tri}x{height_tri}, FPS: {fps}")
     
-    for img in frame_images:
-        # Convert RGB to BGR for OpenCV
+    for img in frame_images_tri:
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        video_writer.write(img_bgr)
+        video_writer_tri.write(img_bgr)
     
-    video_writer.release()
+    video_writer_tri.release()
     
-    print(f"\nVideo saved to: {output_video}")
-    print(f"Total frames: {len(frame_images)}")
-    print(f"Duration: {len(frame_images)/fps:.1f} seconds")
+    # Create video writer for GT-only video
+    gt_video_path = output_video.replace('.mp4', '_gt_only.mp4')
+    video_writer_gt = cv2.VideoWriter(gt_video_path, fourcc, fps, (width_gt, height_gt))
+    
+    print(f"\nWriting GT-only video: {gt_video_path}")
+    print(f"Resolution: {width_gt}x{height_gt}, FPS: {fps}")
+    
+    for img in frame_images_gt:
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        video_writer_gt.write(img_bgr)
+    
+    video_writer_gt.release()
+    
+    print(f"\nVideos saved:")
+    print(f"  1. Triangulated + GT: {output_video}")
+    print(f"  2. GT only: {gt_video_path}")
+    print(f"Total frames: {len(frame_images_tri)}")
+    print(f"Duration: {len(frame_images_tri)/fps:.1f} seconds")
     print("="*60)
     
-    return output_video
+    return output_video, gt_video_path
 
 
 def main():
@@ -1085,8 +1305,8 @@ def main():
     print("PedX 3D Pose Triangulation with Calibration Data")
     print("="*60)
     
-    # Generate the video showing all frames
-    output_video = generate_video(
+    # Generate both videos showing all frames with consistent axis limits
+    tri_video, gt_video = generate_video(
         basedir_2d, basedir_3d, capture_date,
         output_video='triangulation_video.mp4',
         fps=10,
@@ -1095,7 +1315,10 @@ def main():
     
     print("\n" + "="*60)
     print("Processing complete!")
-    print(f"Output video: {output_video}")
+    if tri_video:
+        print(f"Triangulated + GT video: {tri_video}")
+    if gt_video:
+        print(f"GT only video: {gt_video}")
     print("="*60)
 
 

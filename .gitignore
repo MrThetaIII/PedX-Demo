@@ -5,7 +5,10 @@ top*_triangulation_*.png
 
 # Generated video and frames
 triangulation_video.mp4
+triangulation_video_gt_only.mp4
 output_frames/
+output_frames_triangulated/
+output_frames_gt/
 
 # Python
 __pycache__/
